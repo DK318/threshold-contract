@@ -1,0 +1,109 @@
+#include "imports/stdlib.fc";
+
+int op::transfer() asm "0xf8a7ea5 PUSHINT";
+int op::transfer_notification() asm "0x7362d09c PUSHINT";
+
+{-
+  Storage
+  storage#_ is_paused:Bool threshold:Coins admin:MsgAddress = Storage;
+-}
+
+(int, int, slice) load_data() inline {
+  slice ds = get_data().begin_parse();
+  int is_paused = ds~load_uint(1);
+  int threshold = ds~load_coins();
+  slice admin = ds~load_msg_addr();
+  return (is_paused, threshold, admin);
+}
+
+() save_data(int is_paused, int threshold, slice admin) impure inline {
+  builder ds = begin_cell()
+    .store_uint(is_paused, 1)
+    .store_coins(threshold)
+    .store_slice(admin);
+
+  set_data(ds.end_cell());
+}
+
+() on_transfer_notification(slice in_msg_body, slice sender_address) impure {
+  int query_id = in_msg_body~load_uint(64);
+  int jetton_amount = in_msg_body~load_coins();
+  slice from_address = in_msg_body~load_msg_addr();
+  slice either_forward_payload = in_msg_body;
+
+  (int is_paused, int threshold, _) = load_data();
+  if (is_paused | (jetton_amount < threshold)) {
+    cell msg_body = begin_cell()
+      .store_uint(op::transfer(), 32)
+      .store_uint(query_id, 64) ;; query_id
+      .store_coins(jetton_amount) ;; amount
+      .store_slice(from_address) ;; destination
+      .store_slice(from_address) ;; repsonse_destination
+      .store_maybe_ref(null()) ;; custom_payload
+      .store_coins(50000000) ;; forward_ton_amount
+      .store_slice(either_forward_payload) ;; forward_payload
+      .end_cell();
+
+    builder msg = begin_cell()
+      .store_uint(0x18, 6)
+      .store_slice(sender_address)
+      .store_coins(100000000)
+      .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_ref(msg_body);
+
+    send_raw_message(msg.end_cell(), 1);
+  }
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  if (flags & 1) { ;; skip all bounced messages
+    return ();
+  }
+
+  slice sender_address = cs~load_msg_addr();
+  cs~load_msg_addr(); ;; skip dst
+  cs~load_coins(); ;; skip value
+  cs~skip_bits(1); ;; skip extracurrency collection
+  cs~load_coins(); ;; skip ihr fee
+  cs~load_coins(); ;; skip fwd fee
+
+  int op = in_msg_body~load_uint(32);
+
+  if (op == op::transfer_notification()) {
+    on_transfer_notification(in_msg_body, sender_address);
+    return ();
+  }
+
+  if (op == 1) { ;; change is_paused
+    int is_paused = in_msg_body~load_uint(1);
+    (_, int threshold, slice admin) = load_data();
+    throw_unless(777, equal_slices(sender_address, admin));
+    save_data(is_paused, threshold, admin);
+    return ();
+  }
+
+  if (op == 2) { ;; change threshold
+    int threshold = in_msg_body~load_coins();
+    (int is_paused, _, slice admin) = load_data();
+    throw_unless(777, equal_slices(sender_address, admin));
+    save_data(is_paused, threshold, admin);
+    return ();
+  }
+
+  if (op == 3) { ;; change admin
+    slice new_admin = in_msg_body~load_msg_addr();
+    (int is_paused, int threshold, slice admin) = load_data();
+    throw_unless(777, equal_slices(sender_address, admin));
+    save_data(is_paused, threshold, new_admin);
+    return ();
+  }
+
+  throw(0xffff);
+}
